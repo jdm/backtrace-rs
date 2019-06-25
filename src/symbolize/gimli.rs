@@ -4,14 +4,13 @@
 //! all platforms, but it's hoped to be developed over time! Long-term this is
 //! intended to wholesale replace the `libbacktrace.rs` implementation.
 
-use self::gimli::read::EndianRcSlice;
+use self::gimli::read::EndianSlice;
 use self::gimli::RunTimeEndian;
 use crate::symbolize::dladdr;
 use crate::symbolize::ResolveWhat;
 use crate::types::BytesOrWideString;
 use crate::SymbolName;
 use addr2line::gimli;
-use addr2line::object::{self, Object, Uuid};
 use core::cell::RefCell;
 use core::convert::TryFrom;
 use core::mem;
@@ -19,6 +18,8 @@ use core::u32;
 use findshlibs::{self, Segment, SharedLibrary};
 use libc::c_void;
 use memmap::Mmap;
+use object::{Object, Uuid};
+use std::borrow::Cow;
 use std::env;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -29,20 +30,72 @@ const MAPPINGS_CACHE_SIZE: usize = 4;
 type Symbols<'map> = object::SymbolMap<'map>;
 
 struct Mapping {
-    dwarf: addr2line::Context,
     // 'static lifetime is a lie to hack around lack of support for self-referential structs.
+    dwarf: addr2line::Context<EndianSlice<'static, RunTimeEndian>>,
     symbols: Symbols<'static>,
     _map: Mmap,
+}
+
+fn cx<'data, 'file, O: object::Object<'data, 'file>>(
+    file: &'file O,
+) -> Option<addr2line::Context<EndianSlice<'data, RunTimeEndian>>> {
+    let endian = if file.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+
+    fn load_section<'data, 'file, O, S, Endian>(file: &'file O, endian: Endian) -> S
+    where
+        O: object::Object<'data, 'file>,
+        S: gimli::Section<gimli::EndianSlice<'data, Endian>>,
+        Endian: gimli::Endianity,
+    {
+        let data = match file.section_data_by_name(S::section_name()) {
+            Some(Cow::Borrowed(d)) => d,
+            _ => &[],
+        };
+        S::from(EndianSlice::new(data, endian))
+    }
+
+    let debug_abbrev: gimli::DebugAbbrev<_> = load_section(file, endian);
+    let debug_addr: gimli::DebugAddr<_> = load_section(file, endian);
+    let debug_info: gimli::DebugInfo<_> = load_section(file, endian);
+    let debug_line: gimli::DebugLine<_> = load_section(file, endian);
+    let debug_line_str: gimli::DebugLineStr<_> = load_section(file, endian);
+    let debug_ranges: gimli::DebugRanges<_> = load_section(file, endian);
+    let debug_rnglists: gimli::DebugRngLists<_> = load_section(file, endian);
+    let debug_str: gimli::DebugStr<_> = load_section(file, endian);
+    let debug_str_offsets: gimli::DebugStrOffsets<_> = load_section(file, endian);
+    let default_section = gimli::EndianSlice::new(&[], endian);
+
+    addr2line::Context::from_sections(
+        debug_abbrev,
+        debug_addr,
+        debug_info,
+        debug_line,
+        debug_line_str,
+        debug_ranges,
+        debug_rnglists,
+        debug_str,
+        debug_str_offsets,
+        default_section,
+    ).ok()
 }
 
 macro_rules! mk {
     (Mapping { $map:expr, $object:expr }) => {{
         Mapping {
-            dwarf: addr2line::Context::new(&$object).ok()?,
             // Convert to 'static lifetimes since the symbols should
             // only borrow `map` and we're preserving `map` below.
             //
             // TODO: how do we know that `symbol_map` *only* borrows `map`?
+            dwarf: unsafe {
+                mem::transmute::<
+                    addr2line::Context<EndianSlice<'_, RunTimeEndian>>,
+                    addr2line::Context<EndianSlice<'static, RunTimeEndian>>,
+                >(cx(&$object)?)
+            },
             symbols: unsafe { mem::transmute::<Symbols, Symbols<'static>>($object.symbol_map()) },
             _map: $map,
         }
@@ -123,7 +176,7 @@ impl Mapping {
     // Ensure the 'static lifetimes don't leak.
     fn rent<F>(&self, mut f: F)
     where
-        F: FnMut(&addr2line::Context, &Symbols),
+        F: FnMut(&addr2line::Context<EndianSlice<'_, RunTimeEndian>>, &Symbols),
     {
         f(&self.dwarf, &self.symbols)
     }
@@ -146,7 +199,7 @@ thread_local! {
 
 fn with_mapping_for_path<F>(path: PathBuf, f: F)
 where
-    F: FnMut(&addr2line::Context, &Symbols),
+    F: FnMut(&addr2line::Context<EndianSlice<'_, RunTimeEndian>>, &Symbols),
 {
     MAPPINGS_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -234,15 +287,14 @@ pub unsafe fn resolve(what: ResolveWhat, cb: &mut FnMut(&super::Symbol)) {
     // evaluate the DWARF info to find the file/line/name for this address.
     with_mapping_for_path(path, |dwarf, symbols| {
         if let Ok(mut frames) = dwarf.find_frames(addr.0 as u64) {
-            while let Ok(Some(frame)) = frames.next() {
-                let name = frame.function.as_ref().and_then(|f| f.raw_name().ok());
-                let name = name.as_ref().map(|n| n.as_bytes() as *const _);
-                cb.call(&super::Symbol {
-                    inner: Symbol::Frame {
-                        addr: addr.0 as *mut c_void,
-                        frame,
-                        name,
-                    },
+            while let Ok(Some(mut frame)) = frames.next() {
+                let function = frame.function.take();
+                let name = function.as_ref().and_then(|f| f.raw_name().ok());
+                let name = name.as_ref().map(|n| n.as_bytes());
+                cb.call(Symbol::Frame {
+                    addr: addr.0 as *mut c_void,
+                    frame,
+                    name,
                 });
             }
         }
@@ -252,13 +304,10 @@ pub unsafe fn resolve(what: ResolveWhat, cb: &mut FnMut(&super::Symbol)) {
 
         // No DWARF info found, so fallback to the symbol table.
         if let Some(name) = symbols.get(addr.0 as u64).and_then(|x| x.name()) {
-            let sym = super::Symbol {
-                inner: Symbol::Symbol {
-                    addr: addr.0 as usize as *mut c_void,
-                    name: name.as_bytes(),
-                },
-            };
-            cb.call(&sym);
+            cb.call(Symbol::Symbol {
+                addr: addr.0 as usize as *mut c_void,
+                name: name.as_bytes(),
+            });
         }
     });
 
@@ -272,9 +321,14 @@ struct DladdrFallback<'a, 'b> {
 }
 
 impl DladdrFallback<'_, '_> {
-    fn call(&mut self, sym: &super::Symbol) {
+    fn call(&mut self, sym: Symbol) {
         self.called = true;
-        (self.cb)(sym);
+
+        // Extend the lifetime of `sym` to `'static` since we are unfortunately
+        // required to here, but it's ony ever going out as a reference so no
+        // reference to it should be persisted beyond this frame anyway.
+        let sym = unsafe { mem::transmute::<Symbol, Symbol<'static>>(sym) };
+        (self.cb)(&super::Symbol { inner: sym });
     }
 }
 
@@ -293,40 +347,35 @@ impl Drop for DladdrFallback<'_, '_> {
     }
 }
 
-pub enum Symbol {
+pub enum Symbol<'a> {
     /// We were able to locate frame information for this symbol, and
     /// `addr2line`'s frame internally has all the nitty gritty details.
     Frame {
         addr: *mut c_void,
-        frame: addr2line::Frame<EndianRcSlice<RunTimeEndian>>,
-        // Note that this would ideally be `&[u8]`, but we currently can't have
-        // a lifetime parameter on this type. Eventually in the next breaking
-        // change of this crate we should add a lifetime parameter to the
-        // `Symbol` type in the top-level module, and then thread that lifetime
-        // through to here.
-        name: Option<*const [u8]>,
+        frame: addr2line::Frame<EndianSlice<'a, RunTimeEndian>>,
+        name: Option<&'a [u8]>,
     },
     /// We weren't able to find anything in the debuginfo for this address, but
     /// we were able to find an entry into the symbol table for the symbol name.
     Symbol {
         addr: *mut c_void,
         // see note on `name` above
-        name: *const [u8],
+        name: &'a [u8],
     },
     /// We weren't able to find anything in the original file, so we had to fall
     /// back to using `dladdr` which had a hit.
     Dladdr(dladdr::Symbol),
 }
 
-impl Symbol {
+impl Symbol<'_> {
     pub fn name(&self) -> Option<SymbolName> {
         match self {
             Symbol::Dladdr(s) => s.name(),
             Symbol::Frame { name, .. } => {
                 let name = name.as_ref()?;
-                unsafe { Some(SymbolName::new(&**name)) }
+                Some(SymbolName::new(name))
             }
-            Symbol::Symbol { name, .. } => unsafe { Some(SymbolName::new(&**name)) },
+            Symbol::Symbol { name, .. } => Some(SymbolName::new(name)),
         }
     }
 
